@@ -1,31 +1,37 @@
 /* ===========================================================================
  * cudarf.cu
  *
- * Faithful CUDA reconstruction of CudaRF, from:
+ * From-scratch CUDA reconstruction of CudaRF based on the algorithmic
+ * and GPU design described by Grahn, Lavesson, Lapajne, and Slat in their
+ * 2010 and 2011 papers, with documented adaptations for modern CUDA
+ * toolchains.
+ *
+ * References:
  *   Grahn, Lavesson, Lapajne, Slat (2010). "A CUDA Implementation of Random
  *   Forests -- Early Results." Third Swedish Workshop on Multi-core Computing.
  *   Grahn, Lavesson, Lapajne, Slat (2011). "CudaRF: A CUDA-based
  *   Implementation of Random Forests." AICCSA 2011.
  *
- * This is a from-scratch rewrite (v3) of this project's earlier CudaRF
- * reconstruction, replacing it with a single self-contained .cu file and
- * fixing two issues found in the previous version:
+ * This reconstruction is intended for reproducibility and comparative
+ * empirical evaluation. It is not the original source code released by
+ * the original authors.
  *
- *   1. RANDOMNESS: the train/test split is now produced by a small,
+ * Reconstruction notes:
+ *   1. RANDOMNESS: the train/test split is produced by a small,
  *      dependency-free, deterministic routine (splitmix64 + stratified
  *      split) that is pasted BYTE-IDENTICAL into every implementation in
- *      this project. Given the same --seed, every tool now partitions a
- *      dataset into the exact same train/test rows -- this is what makes
- *      cross-implementation comparison valid. (The GPU-side bagging and
- *      mtry sampling inside the forest itself remain implementation-
- *      specific, as bagging is inherently stochastic per RF design; only
- *      the initial train/test partition needs to match across tools.)
+ *      the survey. Given the same --seed, every tool partitions a dataset
+ *      into the exact same train/test rows, which is the foundation of
+ *      cross-implementation comparability. The GPU-side bagging and mtry
+ *      sampling inside the forest remain implementation-specific; only
+ *      the initial train/test partition needs to match across tools.
+ *      Note: this shared split is a benchmarking methodology decision,
+ *      not a feature of the original CudaRF algorithm.
  *
  *   2. HYPERPARAMETERS: --trees, --k (mtry), --depth, --seed and
- *      --trainfrac are now real CLI flags read by argv, not hardcoded
- *      constants. Trees/k are set to reasonable RF defaults (100 trees,
- *      k = sqrt(numFeatures)) rather than the "n_trees=64, k=11" values
- *      silently baked into the earlier two-file-mode code path.
+ *      --trainfrac are real CLI flags read by argv, not hardcoded
+ *      constants. Trees/k default to reasonable RF values (100 trees,
+ *      k = sqrt(numFeatures)).
  *
  * Paper fidelity -- what is reproduced faithfully:
  *   - One CUDA thread builds one entire tree (tree-level granularity),
@@ -43,35 +49,40 @@
  *   - Trees are fully grown with no pruning; numeric attributes only;
  *     no missing-value handling beyond simple mean imputation at load
  *     time (their 2011 paper explicitly lists missing-value handling as
- *     future work -- we do not claim to have solved it, just to not
- *     crash on it).
- *   - The paper's 8-step host/device pipeline (their Fig. 2): read data ->
- *     format & transfer -> bagging kernel (1 thread/tree) -> parallel
- *     tree-build kernel -> OOB classification kernel -> host computes OOB
- *     error -> transfer query data -> prediction kernel (1 thread/tree) ->
- *     transfer results back -> output. All eight steps are present below,
- *     in the same order, and are labelled in the source and in the
- *     terminal output.
+ *     future work).
+ *   - The host/device processing pipeline described in Fig. 2 of the
+ *     2011 paper: data preparation and transfer, GPU bagging kernel
+ *     (1 thread/tree), parallel tree-build kernel, OOB classification
+ *     kernel, host OOB evaluation, query-data preparation, prediction
+ *     kernel (1 thread/tree), result transfer, and output. All steps
+ *     are present below, in the same order, and are labelled in the
+ *     source and in the terminal output.
  *   - GPU optimizations named in the papers: fast approximate math
  *     intrinsics (__logf instead of logf), pinned host memory via
  *     cudaHostAlloc for faster PCIe transfer, texture-object binding for
- *     the read-only test/query data (texture REFERENCES are used in the
- *     papers; texture OBJECTS are the CUDA-12-compatible equivalent, same
- *     migration this project already applied when reconstructing gpuRF),
+ *     the read-only test/query data (texture REFERENCES are described in
+ *     the papers; texture OBJECTS are the CUDA-12-compatible equivalent),
  *     and constant memory for small, frequently-read configuration values.
  *
- * Deliberate deviation, documented honestly:
+ * Deliberate deviations, documented honestly:
  *   - RNG: the papers use the CUDA SDK's Mersenne Twister sampler
  *     (up to 4096 parallel streams), a legacy component that no longer
  *     ships with modern CUDA toolkits. We substitute a small per-thread
  *     splitmix64-style generator for bagging/mtry sampling inside the
  *     forest. This is NOT the same routine as the shared stratified-split
- *     function above -- that one runs once, on the host, before any GPU
- *     work starts, purely to fix the train/test partition. This one runs
- *     per-tree, on the device, for bootstrap sampling and feature
- *     subsampling, and does not need to match any other tool bit-for-bit
- *     (bagging is supposed to differ from run to run and tool to tool;
- *     only the initial train/test split needs to be shared).
+ *     function above -- that one runs once on the host before any GPU
+ *     work starts. The per-tree device RNG runs for bootstrap sampling
+ *     and feature subsampling, and does not need to match any other tool
+ *     bit-for-bit (bagging is supposed to differ from run to run).
+ *   - Texture references: the papers use CUDA texture references, which
+ *     are deprecated in CUDA 12. This reconstruction uses texture objects,
+ *     the modern equivalent, which route reads through the same read-only
+ *     cache path.
+ *
+ * CPU/GPU comparison:
+ *   This executable measures and reports GPU performance only. CPU/GPU
+ *   performance comparison is performed externally by the benchmarking
+ *   methodology and is not part of this executable.
  *
  * Build (WSL2, CUDA 12, RTX 3070):
  *     nvcc -O2 -std=c++14 -arch=sm_86 cudarf.cu -o cudarf
@@ -96,8 +107,6 @@
                           compile ERROR in C++, unlike old C89 */
 
 #include <cuda_runtime.h>
-#include <cstdio>
-#include <unistd.h>   /* access() */
 
 #define CUDA_CHECK(call)                                                     \
     do {                                                                     \
@@ -1066,77 +1075,9 @@ int main(int argc, char **argv) {
     double totalWallMs = std::chrono::duration<double, std::milli>(wallClockEnd - wallClockStart).count();
 
     /* ---- STEP 10 (paper's "output") ---- */
-    /* All GPU measurements are complete at this point.
-     * Now invoke the separately compiled CPU baseline as a child process.
-     * Its execution must not overlap with or pollute any GPU timing above. */
+    /* All GPU measurements are complete. CPU/GPU performance comparison
+     * is performed externally by the benchmarking methodology. */
 
-    double cpuTrainMs  = -1.0; /* -1 = unavailable */
-    bool   baselineOk  = false;
-    std::string baselineStatus = "NOT FOUND";
-
-    /* Build the baseline_rf command with the same parameters CudaRF used.
-     * --mtry: baseline_rf uses --mtry; cudarf uses --k with identical semantics. */
-    {
-        /* Check executable exists */
-        const char *baselineExe = "./baseline_rf";
-        bool exeFound = (access(baselineExe, X_OK) == 0);
-        if (!exeFound) {
-            baselineStatus = "NOT FOUND";
-        } else {
-            /* Construct command string */
-            char cmd[4096];
-            snprintf(cmd, sizeof(cmd),
-                     "./baseline_rf %s --trees %d --mtry %s --depth %d "
-                     "--seed %llu --trainfrac %.6f 2>&1",
-                     args.data.c_str(),
-                     args.trees,
-                     args.kSpec.c_str(),   /* baseline_rf uses --mtry; cudarf uses --k; same values */
-                     args.depth,
-                     args.seed,
-                     args.trainFrac);
-
-            /* Launch baseline as child process, capture stdout+stderr */
-            FILE *pipe = popen(cmd, "r");
-            if (!pipe) {
-                baselineStatus = "LAUNCH_FAILED";
-            } else {
-                char linebuf[1024];
-                std::string firstErrorLine;
-                while (fgets(linebuf, sizeof(linebuf), pipe)) {
-                    /* Parse:  "CPU build time:       XXX.XXX ms  (single-threaded)"
-                     * Variable spacing after the colon, so skip whitespace manually. */
-                    if (strncmp(linebuf, "CPU build time:", 15) == 0) {
-                        double parsed_ms = 0.0;
-                        const char *p = linebuf + 15;
-                        while (*p == ' ' || *p == '\t') p++;
-                        if (sscanf(p, "%lf", &parsed_ms) == 1) {
-                            cpuTrainMs = parsed_ms;
-                        }
-                    } else if (firstErrorLine.empty() &&
-                               (strncmp(linebuf, "Unknown",  7) == 0 ||
-                                strncmp(linebuf, "Failed",   6) == 0 ||
-                                strncmp(linebuf, "csv_load", 8) == 0 ||
-                                strncmp(linebuf, "ERROR",    5) == 0)) {
-                        firstErrorLine = linebuf;
-                        if (!firstErrorLine.empty() && firstErrorLine.back() == '\n')
-                            firstErrorLine.pop_back();
-                    }
-                }
-                int rc = pclose(pipe);
-                if (cpuTrainMs >= 0.0) {
-                    baselineOk = true;
-                    baselineStatus = (rc == 0) ? "SUCCESS" : "SUCCESS (non-zero exit)";
-                } else {
-                    if (!firstErrorLine.empty())
-                        baselineStatus = "FAILED: " + firstErrorLine;
-                    else
-                        baselineStatus = "PARSE_FAILED (no CPU build time line in output)";
-                }
-            }
-        }
-    }
-
-    /* Derived timing values */
     double totalGpuTrainMs = h2dMs + (double)buildMs + d2hMs;
 
     /* ================================================================
@@ -1171,22 +1112,6 @@ int main(int argc, char **argv) {
     printf("GPU Train:             %.3f ms  (bagging+build kernels combined)\n", (double)buildMs);
     printf("D2H:                   %.3f ms  (OOB + test votes)\n", d2hMs);
     printf("Total GPU Train:       %.3f ms  (H2D + GPU Train + D2H)\n", totalGpuTrainMs);
-    printf("\n");
-    if (baselineOk) {
-        printf("CPU baseline:\n");
-        printf("  Implementation:    baseline_rf (single-threaded CPU, Gini, CART)\n");
-        printf("  Execution:         separate child process\n");
-        printf("  Threads:           1\n");
-        printf("  Matching config:   trees=%d  mtry=%s  depth=%d  seed=%llu  trainfrac=%.2f\n",
-               args.trees, args.kSpec.c_str(), args.depth, args.seed, args.trainFrac);
-        printf("  CPU Train:         %.3f ms\n", cpuTrainMs);
-        double speedup = (totalGpuTrainMs > 0.0) ? cpuTrainMs / totalGpuTrainMs : 0.0;
-        printf("Speedup:             %.2fx  (CPU Train / Total GPU Train)\n", speedup);
-    } else {
-        printf("CPU Train:           unavailable\n");
-        printf("Speedup:             unavailable\n");
-    }
-    printf("Baseline status:       %s\n", baselineStatus.c_str());
 
     printf("\n================================================================\n");
     printf("7.3 Prediction Performance\n");
